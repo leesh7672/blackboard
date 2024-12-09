@@ -1,0 +1,11 @@
+[package]
+name = "blackboard"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.21", features = ["glow"] }
+winit = "0.28"
+skia-safe = { path = "../rust-skia/skia-safe", features = ["vulkan"] }
+gstreamer = "0.20"
+gstreamer-video = "0.20"
