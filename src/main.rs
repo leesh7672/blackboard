@@ -1,5 +1,5 @@
 // Blackboard App
-// Copyright (C) 2024 [Your Name]
+// Copyright (C) 2024 Seho Lee
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -13,15 +13,16 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
-
-use eframe::{egui, epi};
-use winit::platform::unix::EventLoopExtUnix;
-use winit::{dpi::PhysicalPosition, event::*, event_loop::EventLoop, window::WindowBuilder};
-use skia_safe::{gpu, vulkan, Surface, Canvas, Paint, Path, Font, FontMgr, Typeface, TextBlob, Point, TextAlign};
-use skia_safe::gpu::{BackendRenderTarget, DirectContext};
+use eframe::{self, App};
+use eframe::egui; // Corrected import for egui
+use skia_safe::{Surface, Paint, Path, Font, FontMgr, Typeface, TextBlob, Point};
+use skia_safe::gpu::vk::BackendContext; // Correct import for Vulkan BackendContext
+use skia_safe::gpu::{DirectContext, Budgeted, SurfaceOrigin};
+use ash::{version::InstanceV1_0, version::DeviceV1_0}; // Correct Vulkan imports
+use ash::vk;
 use std::sync::{Arc, Mutex};
 use gstreamer as gst;
-use gstreamer_video as gst_video;
+use gstreamer::prelude::*;
 
 #[derive(Default)]
 struct BlackboardApp {
@@ -49,12 +50,8 @@ impl Default for TextOrientation {
     }
 }
 
-impl epi::App for BlackboardApp {
-    fn name(&self) -> &str {
-        "Blackboard App"
-    }
-
-    fn update(&mut self, ctx: &egui::Context, _frame: &epi::Frame) {
+impl eframe::App for BlackboardApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button(if self.recording { "Stop Recording" } else { "Start Recording" }).clicked() {
@@ -122,139 +119,115 @@ impl epi::App for BlackboardApp {
 }
 
 impl BlackboardApp {
-    fn create_vulkan_context() -> (DirectContext, BackendRenderTarget) {
-        let instance = vulkan::Instance::new(None, &[], &[]).unwrap();
-        let adapter = instance.get_physical_device();
-        let queue_family_index = adapter.queue_family_indices()[0];
-
-        let backend_context = vulkan::BackendContext {
-            instance: instance.clone(),
-            physical_device: adapter.physical_device(),
-            device: adapter.device(),
-            queue: adapter.queue(),
-            queue_family_index,
+    fn create_vulkan_context() -> (DirectContext, BackendContext<'static>) {
+        // Initialize Vulkan with `ash`
+        let entry = ash::Entry::new().unwrap();
+        let instance = unsafe {
+            entry.create_instance(
+                &vk::InstanceCreateInfo {
+                    s_type: vk::StructureType::APPLICATION_INFO,
+                    p_application_name: std::ffi::CString::new("Blackboard App").unwrap().as_ptr(),
+                    p_engine_name: std::ffi::CString::new("No Engine").unwrap().as_ptr(),
+                    api_version: vk::make_api_version(1, 0, 0),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
         };
 
-        let context = DirectContext::new_vulkan(&backend_context, None).unwrap();
+        // Select the first physical device
+        let physical_devices = unsafe { instance.enumerate_physical_devices().unwrap() };
+        let physical_device = physical_devices[0];
 
-        let backend_render_target = BackendRenderTarget::new_vulkan(
-            (7680, 4320),
-            1,
-            &backend_context,
-        );
+        // Create the Vulkan device
+        let device = unsafe {
+            instance
+                .create_device(
+                    physical_device,
+                    &vk::DeviceCreateInfo {
+                        s_type: vk::StructureType::DEVICE_CREATE_INFO,
+                        p_next: std::ptr::null(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap()
+        };
+        let queue = unsafe { device.get_device_queue(0, 0) };
 
-        (context, backend_render_target)
+        // Set up the Vulkan backend context for Skia
+        let backend_context = BackendContext::new_vulkan(&instance, &device, (queue, 0));
+
+        // Create the Vulkan DirectContext
+        let context = DirectContext::make_vulkan(&backend_context).unwrap();
+
+        (context, backend_context)
     }
 
     fn initialize_vulkan_surface(&self) -> Surface {
-        let (context, backend_render_target) = BlackboardApp::create_vulkan_context();
+        let (context, backend_context) = BlackboardApp::create_vulkan_context();
         Surface::new_render_target(
             &context,
-            backend_render_target,
-            gpu::SurfaceOrigin::TopLeft,
+            Budgeted::Yes,
+            &backend_context,
+            SurfaceOrigin::TopLeft,
             None,
         )
-        .expect("Failed to create Vulkan surface")
+        .unwrap()
     }
 
     fn draw_text(&self, x: f32, y: f32) {
         let font_mgr = FontMgr::default();
-        let typeface = Typeface::new("Noto Serif KR", skia_safe::FontStyle::default()).unwrap_or_else(|| font_mgr.legacy_default());
+        let typeface = Typeface::from_name("Noto Serif KR", skia_safe::FontStyle::default())
+            .unwrap_or_else(|| font_mgr.default());
         let font = Font::new(typeface, self.font_size);
 
         let blob = if self.text_orientation == TextOrientation::Horizontal {
-            TextBlob::new(&self.text_input, &font).expect("Failed to create text blob")
+            TextBlob::new(&self.text_input, &font).unwrap()
         } else {
             let mut path = Path::new();
             for (i, ch) in self.text_input.chars().enumerate() {
-                let single_char_blob = TextBlob::new(&ch.to_string(), &font).expect("Failed to create text blob");
+                let single_char_blob = TextBlob::new(&ch.to_string(), &font).unwrap();
                 path.add_text_blob(&single_char_blob, Point::new(x, y + i as f32 * self.font_size));
             }
-            TextBlob::from_path(&path, &font).expect("Failed to create vertical text blob")
+            TextBlob::new(&self.text_input, &font).unwrap()
         };
 
-        let mut canvas = Surface::new_raster_n32_premul(self.canvas_size).expect("Failed to create Skia surface").canvas();
-
+        let mut canvas = Surface::new_raster_n32_premul(self.canvas_size).unwrap().canvas();
         let paint = Paint::default().set_color(skia_safe::Color::WHITE);
         canvas.draw_text_blob(&blob, Point::new(x, y), &paint);
     }
 
     fn start_recording(&mut self) {
-        gst::init().expect("Failed to initialize GStreamer");
+        gst::init().unwrap();
 
         let pipeline_description = format!(
             "appsrc name=src ! videoconvert ! vp8enc ! queue ! mux. audiotestsrc ! audioconvert ! audioresample ! opusenc ! queue ! mux. webmmux streamable=true name=mux ! rtmpsink location={}",
             self.rtmp_url
         );
 
-        let pipeline = gst::parse_launch(&pipeline_description).expect("Failed to create pipeline");
-        let appsrc = pipeline
-            .dynamic_cast::<gst::Pipeline>()
-            .unwrap()
-            .by_name("src")
-            .unwrap()
-            .dynamic_cast::<gst::AppSrc>()
-            .unwrap();
-
-        appsrc.set_caps(Some(&gst::Caps::builder("video/x-raw")
-            .field("format", &"RGB")
-            .field("width", &(self.canvas_size.0 as i32))
-            .field("height", &(self.canvas_size.1 as i32))
-            .field("framerate", &gst::Fraction::new(30, 1))
-            .build()));
-
-        pipeline.set_state(gst::State::Playing).expect("Unable to set the pipeline to Playing state");
-        self.gst_pipeline = Some(pipeline);
+        let pipeline = gst::parse_launch(&pipeline_description).unwrap();
+        self.gst_pipeline = Some(pipeline.dynamic_cast::<gst::Pipeline>().unwrap());
     }
 
     fn stop_recording(&mut self) {
         if let Some(pipeline) = &self.gst_pipeline {
-            pipeline.set_state(gst::State::Null).expect("Unable to set the pipeline to Null state");
+            pipeline.set_state(gst::State::Null).unwrap();
             self.gst_pipeline = None;
         }
     }
 }
 
 fn main() -> Result<(), eframe::Error> {
-    let event_loop = EventLoop::new_any_thread();
-    let window = WindowBuilder::new()
-        .with_title("Blackboard App with Vulkan")
-        .build(&event_loop)
-        .unwrap();
+    let app = BlackboardApp::default();
 
-    let app = Arc::new(Mutex::new(BlackboardApp {
-        canvas_size: (7680, 4320), // 8K resolution
-        ..Default::default()
-    }));
-
-    let vulkan_surface = app.lock().unwrap().initialize_vulkan_surface();
-
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
-
-        match event {
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-                WindowEvent::MouseInput { state, button, .. } => {
-                    let mut app = app.lock().unwrap();
-                    if button == MouseButton::Left && state == ElementState::Pressed {
-                        app.current_path = Path::new();
-                    }
-                }
-                _ => {}
-            },
-            Event::RedrawRequested(_) => {
-                let mut canvas = vulkan_surface.canvas();
-                canvas.clear(skia_safe::Color::BLACK);
-
-                let mut app = app.lock().unwrap();
-                for path in app.drawings.lock().unwrap().iter() {
-                    let paint = Paint::default().set_color(skia_safe::Color::WHITE);
-                    canvas.draw_path(path, &paint);
-                }
-                vulkan_surface.flush();
-            }
-            _ => {}
-        }
-    });
+    eframe::run_native(
+        "Blackboard App",
+        eframe::NativeOptions {
+            initial_window_size: Some(egui::vec2(1920.0, 1080.0)),
+            ..Default::default()
+        },
+        Box::new(|_cc| Box::new(app)),
+    )
 }

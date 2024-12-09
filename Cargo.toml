@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eframe = { version = "0.21", features = ["glow"] }
-winit = "0.28"
 skia-safe = { path = "../rust-skia/skia-safe", features = ["vulkan"] }
-gstreamer = "0.20"
-gstreamer-video = "0.20"
+eframe = "0.18"  # Upgrade to the latest version for better compatibility
+gstreamer = "0.18"
+gstreamer-app = "0.18"
+ash = "0.34"
